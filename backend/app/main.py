@@ -6,8 +6,7 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect, write_tx
 from app.engines.fefo import consume_fefo
-from app.engines.lot_status import assess_lot, utcnow, HARD_EXPIRED
-from app.engines import open_live
+from app.engines.lot_status import assess_lot, hard_expire_reason, utcnow
 
 app = FastAPI(title="Pantryfifo", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -35,13 +34,14 @@ def _warn_days(c) -> int:
     return int(row["value"]) if row else 3
 
 def _annotate(lot: dict, now: datetime, warn_days: int) -> dict:
-    """把 assess_lot 的一次判定挂到批上；顶条与层页拿到的是同一份字段。"""
-    live = 48.0
-    try:
-        live = float((lot or {}).get("_live_hours") or 48.0)
-    except (TypeError, ValueError):
-        live = 48.0
-    return open_live.fridge_row(lot, now, warn_days, live)
+    """把 assess_lot 的一次判定挂到批上；顶条与层页拿到的是同一份字段。
+
+    已开封批的 open_hours 在开封确认时钉在批上，这里只读批上钉住值，
+    与当前默认开封小时无关（改设置不回溯）。
+    """
+    row = dict(lot)
+    row.update(assess_lot(row, now=now, warn_days=warn_days))
+    return row
 
 def _get_lot(c, lot_id: int) -> dict | None:
     row = c.execute(f"SELECT {LOT_COLS} FROM lots JOIN items ON items.id=lots.item_id WHERE lots.id=?",
@@ -62,12 +62,7 @@ def fridge(layer: str | None = None):
     args = []
     if layer:
         q += " AND items.layer=?"; args.append(layer)
-    live = _default_open_hours(c)
-    rows = []
-    for r in c.execute(q, args):
-        drow = dict(r)
-        drow["_live_hours"] = live
-        rows.append(_annotate(drow, now, warn))
+    rows = [_annotate(dict(r), now, warn) for r in c.execute(q, args)]
     c.close()
     return rows
 
@@ -82,7 +77,7 @@ def alerts():
     c.close()
     out = []
     for r in rows:
-        a = open_live.alerts_row(r, now, warn)
+        a = _annotate(r, now, warn)
         if a["level"] in ("expired", "soon"):
             out.append(a)
     # 硬到期排前
@@ -172,10 +167,17 @@ class ConsumeIn(BaseModel):
 def consume(body: ConsumeIn):
     with write_tx() as c:
         # 持写锁后读取，FEFO 判定与扣减同属一个事务，不会读到半路状态
+        now = utcnow()
         lots = [dict(r) for r in c.execute(
             "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0",
             (body.item_id,))]
-        result = consume_fefo(lots, body.qty)
+        # 与顶条/角标/下架同一次判定：硬到期（日历到期或开封超时）的批不可打，
+        # 即使它有效截止最早 —— 它属于 sweep，不属于消费。
+        skipped = {l["id"] for l in lots if hard_expire_reason(l, now)}
+        alive = [l for l in lots if l["id"] not in skipped]
+        result = consume_fefo(alive, body.qty)
+        if skipped:
+            result["expired_skipped"] = sorted(skipped)
         if not result["ok"] and result["reason"] == "qty_non_positive":
             raise HTTPException(400, result["reason"])
         if not result["ok"]:
@@ -204,11 +206,12 @@ def consume(body: ConsumeIn):
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
+    """下架与顶条/角标同一次判定：日历到期或开封超时（按批上钉住的小时）都收。"""
     c = connect()
     now = utcnow()
-    live = _default_open_hours(c)
+    warn = _warn_days(c)
     lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
-    ids = [l["id"] for l in lots if open_live.sweep_hit(l, now, live)]
+    ids = [l["id"] for l in lots if hard_expire_reason(l, now, warn)]
     for i in ids:
         c.execute("UPDATE lots SET status='expired' WHERE id=? AND status='on_shelf'", (i,))
     c.commit(); c.close()

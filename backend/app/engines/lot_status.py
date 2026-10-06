@@ -57,7 +57,7 @@ def assess_lot(lot: dict, now: datetime | None = None, warn_days: int = 3) -> di
     cal_days_left = (date.fromisoformat(lot["expiry"]) - today).days if lot.get("expiry") else None
 
     cal_expired = cd is not None and now >= cd
-    open_expired = False
+    open_expired = od is not None and now >= od
 
     reason_code = ""
     if cal_expired or open_expired:

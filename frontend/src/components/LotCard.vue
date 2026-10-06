@@ -2,7 +2,7 @@
   <span class="lot" :class="badgeClass">
     <b>{{ lot.name }}</b> ×{{ lot.qty_remain }} · {{ lot.expiry }}
     <em v-if="lot.opened" class="open-mark">已开封</em>
-    <i v-if="lot.opened" class="open-hours" :class="{ over: lot.hours_left < 0 }">
+    <i v-if="lot.opened && lot.hours_left != null" class="open-hours" :class="{ over: lot.hours_left < 0 }">
       {{ lot.hours_left >= 0 ? '剩' + fmt(lot.hours_left) + 'h' : '超时' + fmt(-lot.hours_left) + 'h' }}
     </i>
     <b v-if="lot.reason" class="reason-badge" :class="lot.level">{{ lot.reason }}</b>
