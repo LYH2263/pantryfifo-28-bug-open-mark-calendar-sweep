@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect, write_tx
 from app.engines.fefo import consume_fefo
-from app.engines.lot_status import assess_lot, utcnow, HARD_EXPIRED
+from app.engines.lot_status import utcnow
 from app.engines import open_live
 
 app = FastAPI(title="Pantryfifo", version="0.2.0")
@@ -34,14 +34,9 @@ def _warn_days(c) -> int:
     row = c.execute("SELECT value FROM settings WHERE key='warn_days'").fetchone()
     return int(row["value"]) if row else 3
 
-def _annotate(lot: dict, now: datetime, warn_days: int) -> dict:
-    """把 assess_lot 的一次判定挂到批上；顶条与层页拿到的是同一份字段。"""
-    live = 48.0
-    try:
-        live = float((lot or {}).get("_live_hours") or 48.0)
-    except (TypeError, ValueError):
-        live = 48.0
-    return open_live.fridge_row(lot, now, warn_days, live)
+def _annotate(lot: dict, now: datetime, warn_days: int, live_hours: float) -> dict:
+    """把 assess_lot 的一次判定挂到批上；顶条、层页、总表拿到的是同一份字段。"""
+    return open_live.fridge_row(lot, now, warn_days, live_hours)
 
 def _get_lot(c, lot_id: int) -> dict | None:
     row = c.execute(f"SELECT {LOT_COLS} FROM lots JOIN items ON items.id=lots.item_id WHERE lots.id=?",
@@ -63,26 +58,22 @@ def fridge(layer: str | None = None):
     if layer:
         q += " AND items.layer=?"; args.append(layer)
     live = _default_open_hours(c)
-    rows = []
-    for r in c.execute(q, args):
-        drow = dict(r)
-        drow["_live_hours"] = live
-        rows.append(_annotate(drow, now, warn))
+    rows = [_annotate(dict(r), now, warn, live) for r in c.execute(q, args)]
     c.close()
     return rows
 
 @app.get("/api/alerts")
 def alerts():
-    """顶条：与层页角标共用 assess_lot 的同一次判定口径。"""
+    """顶条：与层页角标共用 _annotate 的同一次判定口径，原因字不另起炉灶。"""
     c = connect()
-    warn = _warn_days(c); now = utcnow()
+    warn = _warn_days(c); now = utcnow(); live = _default_open_hours(c)
     rows = [dict(r) for r in c.execute(
         f"""SELECT {LOT_COLS} FROM lots JOIN items ON items.id=lots.item_id
             WHERE status='on_shelf' AND qty_remain>0""")]
     c.close()
     out = []
     for r in rows:
-        a = open_live.alerts_row(r, now, warn)
+        a = _annotate(r, now, warn, live)
         if a["level"] in ("expired", "soon"):
             out.append(a)
     # 硬到期排前
@@ -155,7 +146,7 @@ def open_lot(lot_id: int):
             raise HTTPException(409, {"reason": "concurrent_change", "lot_id": lot_id})
         row = c.execute("SELECT * FROM lots WHERE id=?", (lot_id,)).fetchone()
         out = _annotate(dict(row) | {"name": lot["name"], "layer": lot["layer"], "unit": lot["unit"]},
-                        now, _warn_days(c))
+                        now, _warn_days(c), hours)
         # 显式回显：余量与开封前一致
         out["qty_unchanged"] = out["qty_remain"] == lot["qty_remain"]
         return out
@@ -175,7 +166,17 @@ def consume(body: ConsumeIn):
         lots = [dict(r) for r in c.execute(
             "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0",
             (body.item_id,))]
-        result = consume_fefo(lots, body.qty)
+        # 消费资格与顶条/角标/下架同一次判定：硬到期（日历或开封超时）的批
+        # 不再参与 FEFO，等下架；不会出现“先到期却还能打到该批”。
+        now = utcnow(); live = _default_open_hours(c)
+        eligible, skipped = [], []
+        for l in lots:
+            if open_live.sweep_hit(l, now, live):
+                skipped.append(l["id"])
+            else:
+                eligible.append(l)
+        result = consume_fefo(eligible, body.qty)
+        result["skipped_expired_ids"] = skipped
         if not result["ok"] and result["reason"] == "qty_non_positive":
             raise HTTPException(400, result["reason"])
         if not result["ok"]:
@@ -204,15 +205,16 @@ def consume(body: ConsumeIn):
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
+    """下架与顶条/角标同一次判定：原因码逐批回显，可核对是否同一世界。"""
     c = connect()
     now = utcnow()
     live = _default_open_hours(c)
     lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
-    ids = [l["id"] for l in lots if open_live.sweep_hit(l, now, live)]
-    for i in ids:
+    reasons = {l["id"]: r for l in lots if (r := open_live.expire_reason(l, now, live))}
+    for i in reasons:
         c.execute("UPDATE lots SET status='expired' WHERE id=? AND status='on_shelf'", (i,))
     c.commit(); c.close()
-    return {"expired_ids": ids}
+    return {"expired_ids": list(reasons), "reasons": reasons}
 
 
 @app.get("/api/settings")

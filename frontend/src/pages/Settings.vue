@@ -13,6 +13,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { api } from '../api'
+import { refreshFridge } from '../store'
 const s = ref({})
 const openHours = ref(48)
 const msg = ref('')
@@ -25,6 +26,8 @@ async function save() {
     method: 'PUT',
     body: JSON.stringify({ default_open_hours: openHours.value }),
   })
+  // 顶条与角标立刻按同一份判定重算；已开封批仍走钉住小时，不会被回溯
+  await refreshFridge()
   msg.value = '已保存：已开封（含已超时待下架）的批不会被回溯'
 }
 onMounted(load)

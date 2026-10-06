@@ -32,9 +32,16 @@ def utcnow() -> datetime:
 
 
 def open_deadline(lot: dict) -> datetime | None:
-    """钉住的开封超时时刻；未开封返回 None。"""
+    """钉住的开封超时时刻；未开封返回 None。
+
+    截止期是一个绝对时刻（opened_at + 钉住小时），按钟点走、自然跨日，
+    不随日历日边界跳变，也不随默认开封小时的修改回溯。
+    """
     if lot.get("opened_at") and lot.get("open_hours") is not None:
-        return datetime.fromisoformat(lot["opened_at"]) + timedelta(hours=float(lot["open_hours"]))
+        opened = datetime.fromisoformat(lot["opened_at"])
+        if opened.tzinfo is None:  # 历史行可能存的是朴素时间，一律按 UTC 解读
+            opened = opened.replace(tzinfo=timezone.utc)
+        return opened + timedelta(hours=float(lot["open_hours"]))
     return None
 
 
@@ -57,7 +64,7 @@ def assess_lot(lot: dict, now: datetime | None = None, warn_days: int = 3) -> di
     cal_days_left = (date.fromisoformat(lot["expiry"]) - today).days if lot.get("expiry") else None
 
     cal_expired = cd is not None and now >= cd
-    open_expired = False
+    open_expired = od is not None and now >= od
 
     reason_code = ""
     if cal_expired or open_expired:
